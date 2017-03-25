@@ -1,5 +1,5 @@
 // F18A In-System Updater
-// TI-99/4A 512k ROM version
+// ColecoVision 256k ROM version
 // This version uses the PureGPU updater
 // code and is intended as a template
 // for porting to other systems.
@@ -121,6 +121,7 @@ static volatile __sfr __at 0xc0 port3;
 #define SELECT 0x2a
 
 // controller keypad map
+// NOTE! 1 and 0 are replaced with P and Q ;)
 const unsigned char keys[16] = {
 	0xff, '8', '4', '5', 
 	0xff, '7', '#', '2',
@@ -140,6 +141,7 @@ const unsigned int PABBUF = 0x1000;	 // File data buffer
 const unsigned int GPUPRG = 0x2800; // GPU program start
 const unsigned int GPUKEY = 0x2802;	// write keypresses here - FF means none
 const unsigned int GPURES = 0x2804;	// read GPU result from here - 0 means success
+// indexes after being read from VDP 0x2804 into the 'R5' array:
 const unsigned char ADRRES = 0;			// read GPU result here - 0 means success
 const unsigned char DSRRES = 1;			// GPU DSR request PAB address here - 0 means none
 const unsigned char CCKRES = 2;			// GPU calculated checksum
@@ -162,6 +164,9 @@ unsigned char PAB[10];	// PAB data is read into five words here
 
 // interface definitions for TI-style DSR simulation
 // through a Peripheral Access Block
+// The system is thus designed to work with a disk
+// file system and sends open, read, and close commands.
+// This ROM emulation does nothing for open and close.
 #define PAB_RECORD_SIZE 128
 #define PAB_BYTES_DESIRED 10
 
@@ -182,6 +187,9 @@ unsigned char PAB[10];	// PAB data is read into five words here
 #define PABIDX_GOTLEN	5
 #define PABIDX_RECORD	6
 
+// We leave room at the top of each page
+// for the bank switching addresses. I left a little
+// extra for future expansion.
 #define RECORDS_PER_PAGE 126
 #define PAGE_BASE 0xC000
 
@@ -256,7 +264,8 @@ void main() {
              
 		// no error, check for a DSR request
 		if (R5[DSRRES]) {
-			// fix endianess of 16-bit value
+			// fix endianess of 16-bit value - GPU is big endian
+			// but the Z80 is little endian.
 			int	pab = ((R5[DSRRES]&0xff00)>>8) | ((R5[DSRRES]&0xff)<<8);
 			dodsr(pab);
 			cont_gpu();
@@ -292,7 +301,7 @@ void gored() {
 
 // GPU has requested a DSR operation
 void dodsr(unsigned int pab) {
-	// again, be careful, numbers are big endian
+	// again, be careful, numbers from the GPU are big endian
 	vmbr(pab, PAB, PAB_BYTES_DESIRED);		// 0=opcode/status,1=buffer,2=record/size,3=rec#,4=off/name
              
 	// check close - it ignores attributes
@@ -336,12 +345,16 @@ void dodsr(unsigned int pab) {
 void dsrread(unsigned int pab) {
 	// first, figure out which file we're reading and
 	// check whether the record is in range. Note that
-	// the EOF is only accurate to within 128 records,
+	// the EOF is only accurate to within 126 records,
 	// so probably isn't very helpful here. ;)
   unsigned char x[2];
   unsigned int firstblock, nextfile;
   unsigned int block, rec, buf;
   
+  // Filename should be either DSK1.F18ABIN or DSK1.F18AROM,
+  // so just pull the first two different characters
+  // to guess which one. Filename starts at pab+10
+  // with a length byte at pab+9
   vmbr(pab+19, x, 2);		// reads 'BI' or 'RO' from filename
 
 	if ((x[0] == 'B') && (x[1] == 'I')) {
@@ -358,13 +371,13 @@ void dsrread(unsigned int pab) {
 		return;
 	}
 
-	// get big endian record number
+	// get big endian record number into little endian variable
 	rec = (PAB[PABIDX_RECORD]<<8) | PAB[PABIDX_RECORD+1];			// record number
 	block = rec / RECORDS_PER_PAGE + firstblock;	// figure out which page address
 	
 	// we also check for wraparound, since we're so close to it
 	// you should check block >= nextfile, but the wraparound
-	// check is probably Coleco specific
+	// check is probably Coleco specific. 
 	if ((block >= nextfile) || (block < FILE1S)) {
 		// past end of file (probably by a lot ;) )
 		PAB[PABIDX_ERROR] |= PABERR_READ_PAST_EOF;
@@ -377,15 +390,19 @@ void dsrread(unsigned int pab) {
 	// get the record's offset in memory
 	rec = (rec % RECORDS_PER_PAGE) * PAB_RECORD_SIZE + PAGE_BASE;
 	
-	// get big endian VDP buffer
+	// get big endian VDP buffer into a little endian variable
 	buf = (PAB[PABIDX_VDPBUF]<<8) | PAB[PABIDX_VDPBUF+1];
 	
 	// copy the data to the requested VDP address
 	vmbw(buf, (unsigned char*)rec, PAB_RECORD_SIZE);
 	
 	// copy is complete, update the PAB (not much to do, we don't have errors)
+	// if you did, just OR the error code into the PAB array like so:
+	//  PAB[PABIDX_ERROR]|=PABERR_BAD_ATTRIBUTE;
+	// and return - the caller will write it back to VDP. Note there are
+	// only 3 bits reserved for error codes, so you can't extend the list.
 	
-	// increment record number (big endian)
+	// increment record number (big endian, manual increment)
 	if (++PAB[PABIDX_RECORD+1] == 0) {
 		++PAB[PABIDX_RECORD];
 	}
@@ -415,6 +432,8 @@ void f18adt() {
 	vwtr(0x391c);		// VR1/57, value 00011100
 	vwtr(0x391c);		// Write twice, unlock
 	vwtr(0x01E0);		// VR1, value 11100000, a real sane setting
+									// this is needed because on a 9918, writing VR39
+									// corrupts VR1.
 
 	// Copy GPU test code to VRAM
 	vmbw(GPUPRG, GPUDT, 6);
@@ -435,6 +454,9 @@ void f18adt() {
 }
 
 // Setup graphics mode (this is a bit redundant... GPU does it too)
+// This would only be needed in the case of no F18A detected, although
+// it does load a nice lower case character set - the F18A doesn't do
+// that part. ;)
 void gmode() {
 	vwtr(0x0000);	// Reg 0: Graphics mode I, external video off
 	vwtr(0x01c2);	// Reg 1: 16K, display on, no interrupt, size = 1, mag = 0.
@@ -461,6 +483,7 @@ void gmode() {
 // The need for slow VDP functions depends on your system, but
 // most systems need them for the case where someone tries to
 // run this code on a 99x8A instead of an F18A.
+// The F18A can always use the fast access functions.
 
 // VDP Single Byte Write
 // this function is slow and safe
